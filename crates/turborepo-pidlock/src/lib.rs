@@ -200,10 +200,14 @@ impl Pidlock {
         let mut contents = String::new();
         if let Err(io_err) = file.read_to_string(&mut contents) {
             warn!("corrupted/invalid pid file at {:?}: {}", self.path, io_err);
-            // Return an error, because None implies that we would succeed at
-            // creating a pid file, but we won't. We require the file to not
-            // exist if we're going to create it.
-            // TODO: should we instead try deleting the file like with stale pids?
+            // Contents that aren't valid UTF-8 can't name a live process, so remove
+            // the file like a stale pid file. Other IO errors leave the file in an
+            // unknown state, so they are returned.
+            if io_err.kind() == io::ErrorKind::InvalidData {
+                fs::remove_file(&self.path)
+                    .map_err(|e| PidFileError::FailedDelete(e, self.path.display().to_string()))?;
+                return Ok(None);
+            }
             return Err(PidFileError::IO(io_err, self.path.display().to_string()));
         }
 
@@ -429,11 +433,9 @@ mod tests {
         drop(file);
 
         let mut pidfile = Pidlock::new(path.clone());
-        // We expect an IO error from trying to read as a utf8 string when it's just
-        // bytes
-        assert_matches!(
-            pidfile.acquire(),
-            Err(PidlockError::File(PidFileError::IO(..)))
-        );
+        // An unreadable pid file can't belong to a live process, so it is removed
+        // and the lock is acquired, the same as a stale pid file.
+        pidfile.acquire().unwrap();
+        assert!(pidfile.locked());
     }
 }
