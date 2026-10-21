@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use tracing::debug;
-use turbopath::{PathError, RelativeUnixPath};
+use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf, PathError, RelativeUnixPath};
 use turborepo_env::EnvironmentVariableMap;
 use turborepo_process::Command;
 use turborepo_repository::{
@@ -21,6 +21,23 @@ use crate::MfeConfigProvider;
 fn apply_environment(cmd: &mut Command, environment: &EnvironmentVariableMap) {
     cmd.env_clear();
     cmd.envs(environment.iter());
+}
+
+/// Finds a locally installed binary by searching `node_modules/.bin` from the
+/// package directory up to the repository root, so binaries hoisted by npm or
+/// yarn are found. Falls back to the package's own `node_modules/.bin` when no
+/// installed copy exists.
+fn find_local_bin(
+    package_dir: &AbsoluteSystemPath,
+    repo_root: &AbsoluteSystemPath,
+    bin_name: &str,
+) -> AbsoluteSystemPathBuf {
+    package_dir
+        .ancestors()
+        .take_while(|dir| repo_root.contains(dir))
+        .map(|dir| dir.join_components(&["node_modules", ".bin", bin_name]))
+        .find(|candidate| candidate.as_std_path().exists())
+        .unwrap_or_else(|| package_dir.join_components(&["node_modules", ".bin", bin_name]))
 }
 
 /// Trait for providing commands to execute tasks.
@@ -600,8 +617,7 @@ impl<'a, M: MfeConfigProvider, E: From<CommandProviderError>> CommandProvider<E>
                 "microfrontends"
             };
 
-            // TODO: leverage package manager to find the local proxy
-            let program = package_dir.join_components(&["node_modules", ".bin", bin_name]);
+            let program = find_local_bin(&package_dir, package_context.repository_root(), bin_name);
             let mut cmd = Command::new(program.as_std_path());
             cmd.current_dir(package_dir).args(args).open_stdin();
             apply_environment(&mut cmd, environment);
@@ -1244,6 +1260,44 @@ mod tests {
         assert!(
             cmd.label()
                 .ends_with(&format!(" proxy {} --names docs-app", config_path.as_str()))
+        );
+        let stdout = command_stdout(cmd).await;
+
+        assert_filtered_environment(&stdout, inherited_env);
+    }
+
+    #[tokio::test]
+    async fn test_microfrontends_binary_proxy_resolves_hoisted_install() {
+        let (_tempdir, repo_root, package_dir) = create_test_repo();
+        let inherited_env = inherited_env_name();
+        // Package managers that hoist dependencies (npm, yarn) place the binary in
+        // the repository root's node_modules instead of the package's own.
+        write_microfrontends_binary(repo_root.as_std_path(), inherited_env);
+        let package_graph = package_graph(
+            &repo_root,
+            &package_dir,
+            PackageJson {
+                dependencies: Some(BTreeMap::from([(
+                    "@vercel/microfrontends".to_owned(),
+                    "1.0.0".to_owned(),
+                )])),
+                ..Default::default()
+            },
+        )
+        .await;
+        let cmd = proxy_command(&package_graph, &filtered_environment());
+        assert_eq!(
+            cmd.program(),
+            repo_root
+                .as_std_path()
+                .join("node_modules")
+                .join(".bin")
+                .join(if cfg!(windows) {
+                    "microfrontends.cmd"
+                } else {
+                    "microfrontends"
+                })
+                .as_os_str()
         );
         let stdout = command_stdout(cmd).await;
 
